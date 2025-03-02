@@ -6,57 +6,94 @@ import math
 
 
 class CausalSelfAttention(nn.Module):
-
+    """
+    Causal self-attention module that implements the masked multi-head attention mechanism.
+    In causal self-attention, each token can only attend to itself and previous tokens.
+    """
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         
+        # Combined projection for Q, K, V - projects from n_embd to 3 * n_embd (for Q, K, V)
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
+        # Create causal mask to ensure tokens can only attend to previous tokens
+        # Shape: (1, 1, block_size, block_size)
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                             .view(1, 1, config.block_size, config.block_size)) 
     
     def forward(self, x):
+        # x shape: (B, T, C) where:
+        # B = batch size
+        # T = sequence length
+        # C = embedding dimension (n_embd)
         B, T, C = x.size()
 
+        # Project input to Q, K, V
+        # qkv shape: (B, T, 3 * C)
         qkv = self.c_attn(x)
+        # Split into Q, K, V
+        # Each has shape: (B, T, C)
         q, k, v = qkv.split(self.n_embd, dim=2)
+        
+        # Reshape Q, K, V for multi-head attention
+        # Shape becomes: (B, nh, T, hs) where:
+        # nh = number of heads
+        # hs = head size (C // n_head)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
+        # Compute attention scores
+        # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # Apply causal mask: sets attention scores to -inf where mask is 0
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # Apply softmax to get attention weights
         att = F.softmax(att, dim=-1)
+        
+        # Apply attention to values
+        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
         y = att @ v
+        # Reshape back to (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
+        # Final output projection
+        # Shape remains (B, T, C)
         y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
-
+    """
+    Multi-layer perceptron with GELU activation.
+    Expands embedding dimension by 4x then projects back.
+    """
     def __init__(self, config):
         super().__init__()
+        # Input projection: n_embd -> 4 * n_embd
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
+        # Output projection: 4 * n_embd -> n_embd
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        # x shape: (B, T, C)
+        x = self.c_fc(x)    # -> (B, T, 4C)
+        x = self.gelu(x)    # -> (B, T, 4C)
+        x = self.c_proj(x)  # -> (B, T, C)
         return x
 
 class Block(nn.Module):
-
+    """
+    Transformer block: LayerNorm -> Attention -> LayerNorm -> MLP
+    Each with residual connections
+    """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -65,47 +102,57 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # x shape: (B, T, C)
+        x = x + self.attn(self.ln_1(x))  # Residual connection
+        x = x + self.mlp(self.ln_2(x))   # Residual connection
         return x
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    attn_pdrop: float = 0.1
-    resid_pdrop: float = 0.1
+    """Configuration class for GPT model hyperparameters"""
+    block_size: int = 1024    # Maximum sequence length
+    vocab_size: int = 50257   # Size of vocabulary
+    n_layer: int = 12        # Number of transformer blocks
+    n_head: int = 12         # Number of attention heads
+    n_embd: int = 768        # Embedding dimension
 
 class GPT(nn.Module):
-
+    """
+    GPT Language Model with token and position embeddings,
+    followed by a stack of transformer blocks
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),  # Token embeddings
+            wpe = nn.Embedding(config.block_size, config.n_embd),  # Position embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = nn.LayerNorm(config.n_embd),  # Final layer norm
         ))
 
+        # Project to vocabulary size for next token prediction
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx):
+        # idx shape: (B, T) - Input token indices
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
     
+        # Generate position indices and get embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emd = self.transformer.wpe(pos)
-        tok_emd = self.transformer.wte(idx)
-        x = tok_emd + pos_emd
+        pos_emd = self.transformer.wpe(pos)  # (T, C)
+        tok_emd = self.transformer.wte(idx)  # (B, T, C)
+        x = tok_emd + pos_emd                # (B, T, C) - Implicitly broadcasting position embeddings
+        
+        # Apply transformer blocks
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
+            x = block(x)                             # (B, T, C)
+        
+        x = self.transformer.ln_f(x)                 # (B, T, C)
+        # Project to vocabulary size
+        logits = self.lm_head(x)                    # (B, T, vocab_size)
         return logits
     
     @classmethod
