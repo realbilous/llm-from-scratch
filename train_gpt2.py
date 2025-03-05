@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import tiktoken
+import time
 
 
 class CausalSelfAttention(nn.Module):
@@ -18,6 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -49,17 +52,21 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Compute attention scores
-        # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # Apply causal mask: sets attention scores to -inf where mask is 0
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        # Apply softmax to get attention weights
-        att = F.softmax(att, dim=-1)
-        
-        # Apply attention to values
-        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-        y = att @ v
+        # Vanilla attention implementation
+        # # Compute attention scores
+        # # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # # Apply causal mask: sets attention scores to -inf where mask is 0
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # # Apply softmax to get attention weights
+        # att = F.softmax(att, dim=-1)
+        # # Apply attention to values
+        # # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        # y = att @ v
+
+        # Flash attention implementation
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # Reshape back to (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -135,7 +142,24 @@ class GPT(nn.Module):
         # Project to vocabulary size for next token prediction
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # sharing wte weights
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init weights (following openai gpt-2)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_embd) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)  
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         # idx shape: (B, T) - Input token indices
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -152,8 +176,12 @@ class GPT(nn.Module):
         
         x = self.transformer.ln_f(x)                 # (B, T, C)
         # Project to vocabulary size
-        logits = self.lm_head(x)                    # (B, T, vocab_size)
-        return logits
+        logits = self.lm_head(x)     
+        
+        loss = None       
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))       # (B, T, vocab_size)
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -204,41 +232,105 @@ class GPT(nn.Module):
 
         return model
 
-# ------------------------------------------------------------------------------------------------
+# --- DataLoader ------------------------------------------------------------------------------------------------
 
-num_return_sequences = 5
-max_length = 30
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
 
-model = GPT.from_pretrained('gpt2')
-print("Model loaded")
-model.eval()
-model.to('cuda')
+        with open('input.txt', 'r') as f:
+            text = f.read()
 
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epochs = {len(self.tokens) // (self.B * self.T)} batches")
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :] 
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, num_samples=1)
-        xcol = torch.gather(topk_indices, dim=-1, index=ix)
-        x = torch.cat((x, xcol), dim=1)
+        self.current_position = 0    
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B*T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+        if self.current_position >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+# --- inference ------------------------------------------------------------------------------------------------
+
+# num_return_sequences = 5
+# max_length = 30
+
+# # model = GPT.from_pretrained('gpt2')
+# model = GPT(GPTConfig())
+# print("Model loaded")
+# model.eval()
+# model.to('cuda')
+
+# import tiktoken
+# enc = tiktoken.get_encoding("gpt2")
+# tokens = enc.encode("Hello, I'm a language model")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to('cuda')
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while x.size(1) < max_length:
+#     with torch.no_grad():
+#         logits = model(x)
+#         logits = logits[:, -1, :] 
+#         probs = F.softmax(logits, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         ix = torch.multinomial(topk_probs, num_samples=1)
+#         xcol = torch.gather(topk_indices, dim=-1, index=ix)
+#         x = torch.cat((x, xcol), dim=1)
 
 
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print('-' * 40)
-    # print(tokens)
-    print(decoded)
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print('-' * 40)
+#     # print(tokens)
+#     print(decoded)
 
+# --- training ------------------------------------------------------------------------------------------------
+# Selecting the device
+device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+print("using device: ", device)
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=4, T=1024)
+
+torch.set_float32_matmul_precision('high')
+
+# Creating the model
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+torch.compile(model)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16): # slows down the training for NVIDIA GeForce GTX 1050 Ti, but could speed up for other GPUs
+    logits, loss = model(x, y)
+    #  import code; code.interact(local=dict(globals(), **locals()))
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step: {i}, loss: {loss.item()}, time: {dt:.2f}ms, tokens/s: {tokens_per_second:.2f}")
+
+import sys; sys.exit(0)
 
