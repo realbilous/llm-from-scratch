@@ -258,15 +258,23 @@ class GPT(nn.Module):
 # --- DataLoader ------------------------------------------------------------------------------------------------
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, input_file):
+        """
+        Args:
+            B: batch size
+            T: sequence length (tokens per sequence)
+            input_file: path to input text file
+        """
         self.B = B
         self.T = T
 
-        with open('input.txt', 'r') as f:
+        with open(input_file, 'r') as f:
             text = f.read()
 
+        # Convert text to tokens using GPT-2 tokenizer
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
+        # Convert to 1D tensor of shape (n_tokens,)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epochs = {len(self.tokens) // (self.B * self.T)} batches")
@@ -275,8 +283,12 @@ class DataLoaderLite:
         
     def next_batch(self):
         B, T = self.B, self.T
+        # Get sequence of tokens for batch, including next token for targets
+        # buf shape: (B*T + 1,)
         buf = self.tokens[self.current_position:self.current_position + B*T + 1]
+        # x shape: (B, T) - input sequences
         x = buf[:-1].view(B, T)
+        # y shape: (B, T) - target sequences (shifted by 1)
         y = buf[1:].view(B, T)
         self.current_position += B * T
         if self.current_position + (B * T + 1) >= len(self.tokens):
@@ -302,7 +314,7 @@ grad_accum_steps = total_batch_size // (B * T)
 print(f"total desired batch size {total_batch_size}")
 print(f"=> calculated grad_accum_steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, input_file='input.txt')
 
 torch.set_float32_matmul_precision('high')
 
@@ -328,26 +340,44 @@ def get_lr(it):
 # Optimizer
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+# Training loop with gradient accumulation
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
     loss_accum = 0.0
+    
+    # Gradient accumulation loop
     for micro_step in range(grad_accum_steps):
+        # x shape: (B, T) - input token indices
+        # y shape: (B, T) - target token indices
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # with torch.autocast(device_type=device, dtype=torch.bfloat16): # slows down the training for NVIDIA GeForce GTX 1050 Ti, but could speed up for other GPUs
+        
+        # Forward pass
+        # logits shape: (B, T, vocab_size)
+        # loss is scalar
         logits, loss = model(x, y)
+        
+        # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
+    
+    # Clip gradients to prevent explosion
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
+    # Update learning rate according to schedule
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    
+    # Update weights
     optimizer.step()
     torch.cuda.synchronize()
+    
+    # Calculate and print metrics
     t1 = time.time()
-    dt = (t1 - t0) # * 1000
+    dt = (t1 - t0)
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
     tokens_per_second = tokens_processed / dt
     print(f"step: {step} | lr: {lr:.4e} | loss: {loss.item()} | norm: {norm:.4f} | dt: {dt:.2f}s | tokens/s: {tokens_per_second:.2f}")
@@ -365,29 +395,46 @@ print("### Model inference ###")
 model.eval()
 model.to('cuda')
 
-import tiktoken
+# Tokenize input prompt
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("Hello, I'm a language model")
+# Convert to tensor and repeat for multiple sequences
+# tokens shape: (num_return_sequences, prompt_length)
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
 x = tokens.to('cuda')
 
+# Set random seed for reproducibility
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
+
+# Generate tokens auto-regressively
 while x.size(1) < max_length:
     with torch.no_grad():
+        # logits shape: (num_return_sequences, sequence_length, vocab_size)
         logits, _ = model(x)
+        # Get logits for next token prediction
+        # logits shape: (num_return_sequences, vocab_size)
         logits = logits[:, -1, :] 
+        # Convert to probabilities
         probs = F.softmax(logits, dim=-1)
+        # Get top-k probabilities and indices
+        # topk_probs shape: (num_return_sequences, 50)
+        # topk_indices shape: (num_return_sequences, 50)
         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # Sample from top-k
+        # ix shape: (num_return_sequences, 1)
         ix = torch.multinomial(topk_probs, num_samples=1)
+        # Get selected token indices
+        # xcol shape: (num_return_sequences, 1)
         xcol = torch.gather(topk_indices, dim=-1, index=ix)
+        # Append new tokens
+        # x shape: (num_return_sequences, sequence_length + 1)
         x = torch.cat((x, xcol), dim=1)
 
-
+# Decode and print generated sequences
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print('-' * 40)
-    # print(tokens)
     print(decoded)
